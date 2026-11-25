@@ -1,0 +1,221 @@
+# Athlex — stack completa: infraestrutura, 4 microservices e observabilidade.
+#   cp .env.example .env   (trocar as senhas)   ->   docker compose up -d --build
+# Gateway: http://localhost:8080 | Consul: :8500 | Zipkin: :9411 | Prometheus: :9090 | Grafana: :3000
+name: athlex
+
+services:
+  # ---------------- Infraestrutura ----------------
+  consul:
+    image: hashicorp/consul:1.20
+    command: agent -dev -client=0.0.0.0 -ui
+    ports: ["8500:8500"]
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [athlex]
+
+  # Grava a configuração centralizada (KV) a partir do .env — nenhum segredo no repositório
+  consul-init:
+    image: hashicorp/consul:1.20
+    depends_on:
+      consul:
+        condition: service_healthy
+    environment:
+      CONSUL_HTTP_ADDR: consul:8500
+      DB_USER: ${DB_USER:?defina DB_USER no .env}
+      DB_PASSWORD: ${DB_PASSWORD:?defina DB_PASSWORD no .env}
+      JWT_SECRET: ${JWT_SECRET:?defina JWT_SECRET no .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?defina ADMIN_PASSWORD no .env}
+      AUTH_DB_HOST: postgres-auth
+      PRODUCT_DB_HOST: postgres-product
+      ORDER_DB_HOST: postgres-order
+    volumes:
+      - ./infra/consul_kv.sh:/consul_kv.sh:ro
+    entrypoint: ["sh", "/consul_kv.sh"]
+    restart: "no"
+    networks: [athlex]
+
+  # Database per Service: um PostgreSQL (e um volume) para cada microservice
+  postgres-auth:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: db_user
+      POSTGRES_USER: ${DB_USER:?defina DB_USER no .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?defina DB_PASSWORD no .env}
+    volumes:
+      - pg_auth:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [athlex]
+
+  postgres-product:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: db_product
+      POSTGRES_USER: ${DB_USER:?defina DB_USER no .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?defina DB_PASSWORD no .env}
+    volumes:
+      - pg_product:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [athlex]
+
+  postgres-order:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: db_order
+      POSTGRES_USER: ${DB_USER:?defina DB_USER no .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?defina DB_PASSWORD no .env}
+    volumes:
+      - pg_order:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [athlex]
+
+  # ---------------- Microservices ----------------
+  auth-api:
+    build: ./auth-api
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      CONSUL_HOST: consul
+      ZIPKIN_URL: http://zipkin:9411/api/v2/spans
+      LOKI_URL: http://loki:3100/loki/api/v1/push
+    depends_on:
+      consul-init:
+        condition: service_completed_successfully
+      postgres-auth:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8200'"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 40s
+    restart: unless-stopped
+    networks: [athlex]
+
+  product-api:
+    build: ./product-api
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      CONSUL_HOST: consul
+      ZIPKIN_URL: http://zipkin:9411/api/v2/spans
+      LOKI_URL: http://loki:3100/loki/api/v1/push
+    depends_on:
+      consul-init:
+        condition: service_completed_successfully
+      postgres-product:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8100'"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 40s
+    restart: unless-stopped
+    networks: [athlex]
+
+  order-api:
+    build: ./order-api
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      CONSUL_HOST: consul
+      ZIPKIN_URL: http://zipkin:9411/api/v2/spans
+      LOKI_URL: http://loki:3100/loki/api/v1/push
+    depends_on:
+      consul-init:
+        condition: service_completed_successfully
+      postgres-order:
+        condition: service_healthy
+      product-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8400'"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 40s
+    restart: unless-stopped
+    networks: [athlex]
+
+  gateway-api:
+    build: ./gateway-api
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      CONSUL_HOST: consul
+      ZIPKIN_URL: http://zipkin:9411/api/v2/spans
+      LOKI_URL: http://loki:3100/loki/api/v1/push
+    depends_on:
+      consul-init:
+        condition: service_completed_successfully
+      auth-api:
+        condition: service_healthy
+      product-api:
+        condition: service_healthy
+      order-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8080'"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 40s
+    ports: ["8080:8080"]
+    restart: unless-stopped
+    networks: [athlex]
+
+  # ---------------- Observabilidade ----------------
+  zipkin:   # tracing distribuído
+    image: openzipkin/zipkin:3
+    ports: ["9411:9411"]
+    networks: [athlex]
+
+  loki:     # logs centralizados (os serviços enviam direto via loki-logback-appender)
+    image: grafana/loki:3.3.2
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki_data:/loki
+    networks: [athlex]
+
+  prometheus:   # métricas (scrape de /actuator/prometheus)
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+    ports: ["9090:9090"]
+    networks: [athlex]
+
+  grafana:      # dashboards + explorar logs (Loki) e traces (Zipkin)
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?defina GRAFANA_PASSWORD no .env}
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on: [prometheus, loki, zipkin]
+    ports: ["3000:3000"]
+    networks: [athlex]
+
+networks:
+  athlex:
+
+volumes:
+  pg_auth:
+  pg_product:
+  pg_order:
+  loki_data:
+  prom_data:
+  grafana_data:
